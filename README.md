@@ -58,9 +58,12 @@ python vol.py -f mem.dmp windows.wsl.linux_plugins --linux-plugin <name> [option
 | `--dump-extra-regions` | Also write the process's other memory spans to separate files |
 
 Every run writes (or reuses) `vmmemwsl.pid<PID>.dmp` in the current directory —
-the guest's RAM (about the size of the VM's memory, several GB). If a file for
-the same PID and size already exists it is reused, so chained commands are fast.
-Run from a directory with enough free disk space.
+the guest's RAM (about the size of the VM's memory, several GB), plus a small
+`vmmemwsl.pid<PID>.dmp.json` recording which Windows image, process and layout it came
+from. An existing dump is reused (so chained commands are fast) only if that record
+matches the current run exactly; a dump with no record, or made from a different image,
+is re-written, so a stale dump can never be mistaken for the current capture. Run from a
+directory with enough free disk space.
 
 ### Tested results
 
@@ -80,6 +83,8 @@ Other guest sizes (kernel 6.18.33.2):
 |---|---|---|---|
 | WSL up ~8 minutes | 2 GiB | one RAM VAD, no hole (e820 confirmed) | `pslist`, `psscan`, `lsmod`, `bash`, `lsof`, `sockstat`, `ip.Addr`, `kthreads`, `netfilter`, `pstree` all return data |
 | WSL up ~9 hours, idle | 6 GiB | two RAM VADs, hole at `0xF8000000` (e820 confirmed) | layout correct, but list-walking plugins are truncated because Windows had paged part of the guest out (see Limitations) |
+| WSL up a few minutes, `memory=4GB` | ~3.9 GiB + 128 MiB | low and high RAM VADs, the high one *below* the low one in host memory (not adjacent); hole at `0xF8000000` (e820 confirmed) | all seven plugins tried return data (`pslist` 277, `psscan` 587, `bash` 656, `lsof` 2,286, `sockstat` 550, `lsmod` 23, `ip.Addr` 6) |
+| WSL up a few minutes, VMware Workstation also running | 6 GiB | two RAM VADs, hole at `0xF8000000` (e820 confirmed); one `vmmem`-type candidate (VMware's VM is `vmware-vmx.exe`, not `vmmem`) | `pslist` 133 tasks (kernel threads only), `lsmod` 29, `lsof` 16, `psscan` 582; `bash`, `sockstat`, `ip.Addr` empty: same paged-out-pages limitation |
 
 Other `linux.*` plugins are exposed too but were not individually tested.
 
@@ -87,16 +92,21 @@ Other `linux.*` plugins are exposed too but were not individually tested.
 
 1. **Find the host process.** Walk the Windows process list for `vmmemWSL`/`vmmem`.
    A recently exited instance can linger with no memory; such candidates are
-   skipped with a warning and the next one is tried.
-2. **Extract guest RAM.** The guest's RAM is a run of adjacent VADs in that
-   process; they are merged and the largest run is streamed to disk. The guest's
+   skipped with a warning and the next one is tried. `vmmemWSL` is tried before plain
+   `vmmem` (which other lightweight VMs also use), and a process whose memory turns out
+   not to be an analysable Linux guest (no matching ISF, or not Linux at all) is skipped
+   in favour of the next.
+2. **Extract guest RAM.** The guest's RAM is a few of that process's VADs: a low
+   block, and above 4 GiB a high block. They are chosen by what they are (committed
+   pages, the 3-4 GiB low block first), *not* by being next to each other in host
+   memory, and streamed to disk in guest-physical order. The guest's
    physical address map has an MMIO (device) hole below 4 GiB that the host
    doesn't map, so the plugin re-inserts it as zeros. That makes *file offset ==
    guest-physical address*, which is what the Linux page-table code expects.
    (Without it, everything above 4 GiB is read from the wrong place and every
    plugin except `psscan` returns nothing.) The hole is **detected, not
    assumed**: Hyper-V's worker allocates the low-RAM block and the high-RAM block
-   as two adjacent VADs, so the first VAD's size is where the hole starts and the
+   as two separate VADs, so the low VAD's size is where the hole starts and the
    high block resumes at 4 GiB (on the tested guests: hole `0xF8000000–0x100000000`,
    128 MiB). The result is then cross-checked against the guest kernel's own
    `BIOS-e820` boot-log lines found in the dump, and the plugin warns if they
@@ -172,8 +182,8 @@ takes addresses from the real kernel.
 - Needs a matching ISF per WSL kernel version; only 5.15.167.4 and 6.18.33.2 are supplied.
 - The MMIO hole is detected from the Windows VAD layout (and checked against the
   guest's e820 map), assuming the high-RAM block resumes at 4 GiB. Tested on
-  15.5 GiB and 6 GiB guests (two RAM VADs, hole) and a 2 GiB guest (one RAM VAD,
-  no hole); other sizes use the same logic but are untested. If the layout can't be derived from the VADs the
+  15.5, 6 and 4 GiB guests (two RAM VADs, hole; in the 4 GiB one the blocks were not
+  adjacent in host memory) and a 2 GiB guest (one RAM VAD, no hole); other sizes use the same logic but are untested. If the layout can't be derived from the VADs the
   plugin falls back to the usual 128 MiB at `0xF8000000` and says so. The e820
   check is skipped when an existing dump is reused, and finds nothing if the
   guest's boot log has been overwritten.
@@ -188,6 +198,13 @@ takes addresses from the real kernel.
   sampled pages were paged out. That cut `pslist` to 11 tasks, because the walk
   stops at the first unreadable page (PID 1's `task_struct` was one), while
   `psscan`, which scans physical memory and follows no pointers, still found 394.
+  Long idleness is not the only cause: a 6 GiB guest started minutes earlier but
+  captured while VMware Workstation was also running on the host (memory pressure)
+  had ~5% of sampled pages paged out and ~2% in other non-resident states. That was
+  enough to stop the task-list walk after the 134 kernel threads (a guest page-table
+  page was unreadable), so no user process such as `bash` was reached, `bash` and
+  `sockstat` returned nothing, and `ip.Addr` was empty, while `psscan` still found
+  582 tasks including five `bash` processes.
   The plugin does not currently warn about this. Take the capture soon after the
   WSL activity you care about, and compare against `psscan` when `pslist` looks
   short. Volatility can read paged-out pages back from the paging file(s) via its

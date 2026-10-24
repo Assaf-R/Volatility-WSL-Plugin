@@ -54,36 +54,42 @@ itself.
 2. `_find_wsl_candidates()` — every process named `vmmemWSL`/`vmmem`. A
    recently-exited instance can still sit in the process list with an empty VAD
    tree, so all matches are returned, not just the first.
-3. For each candidate in turn, `_dump_guest_memory()`. A candidate with no usable
-   memory is skipped with a warning; if none work, a descriptive error is raised.
-4. `_run_linux_plugin(dump_path)` on the first candidate that dumped.
+3. Candidates are tried in order, a process literally named `vmmemWSL` first (plain
+   `vmmem` is also used by other lightweight VMs such as Windows Sandbox). For each,
+   `_dump_guest_memory()`; a candidate with no usable memory is skipped with a warning.
+4. `_run_linux_plugin(dump_path)` on each candidate that dumped. If the memory is not an
+   analysable Linux guest (`UnsatisfiedException`: no matching ISF, or not a Linux VM)
+   the next candidate is tried. Only when candidates run out is an error logged: the
+   ISF problem if any candidate dumped but couldn't be analysed (a later stale process
+   can't hide it), otherwise "no candidate had usable guest memory".
 
 ### 1.4 `_dump_guest_memory()` and `_dump_span()`
 
-**One VAD is not the guest.** `vmmemWSL` has several VADs, and the low part of
-guest RAM can sit in a *smaller* VAD than the biggest one. So the VADs are sorted
-by start address, every run where one VAD's end + 1 equals the next VAD's start is
-merged into a span, and the largest **span** is dumped:
+**Which VADs are the guest.** `vmmemWSL` has several VADs, and guest RAM is split
+across them: a *low block* (guest-physical 0 up to the MMIO hole; `0xF8000000` bytes on a
+guest of 3.875 GiB or more) and a *high block* from 4 GiB up. Neither the biggest VAD
+alone nor "VADs that are adjacent in host memory" is reliable. The first version merged
+adjacent VADs and took the largest run; that worked on five captures where the two blocks
+happened to sit end to end, and silently lost the high block on a 4 GiB guest, where it
+was allocated at a *lower* host address (and the e820 check then wrongly agreed). So
+`_select_ram_ranges()` picks the VADs by what they are:
 
-```python
-for vad in sorted(vads, key=lambda v: v.get_start()):
-    if spans and spans[-1][1] + 1 == vad.get_start():
-        spans[-1][1] = vad.get_end()          # extend the current span
-    else:
-        spans.append([vad.get_start(), vad.get_end(), [vad]])
-```
+1. only VADs with committed pages are candidates (below);
+2. VADs of 32 MiB or less are ignored: every `vmmem` process holds one fixed 32 MiB
+   private VAD that is not guest RAM (the guest's e820 map has nothing there);
+3. the VAD whose size is 3-4 GiB is the low block and goes first; any other remaining
+   VAD is higher RAM and follows in host-address order. A guest under 3.875 GiB has just
+   the one block.
 
-Host-VA adjacency ties the VADs together as one physical range; an unrelated big
-allocation elsewhere in the process won't sit exactly end to end with guest RAM.
+The chosen `(host start, size)` ranges are streamed back to back in that order, with the
+hole's zeros inserted at the low block's end, so the file is laid out by guest-physical
+address whatever the host order was.
 
 **Only committed VADs are candidates.** Every `vmmemWSL` process also carries a ~4 GiB
 `PAGE_NOACCESS` reservation (`0x10000-0xffffffff`, commit charge 0) that holds no data.
 On the 15.5 GiB guests the RAM out-sizes it, but on a 2 GiB guest the reservation is the
 "largest span" and was dumped instead (an empty 4 GiB file, then "ISF not satisfied"). So
 VADs with a commit charge of 0 are ignored (falling back to all VADs if none is committed).
-A 32 MiB VAD that is always present can end up host-adjacent to the RAM (it did on the
-2 GiB guest), in which case it is merged into the span as harmless trailing data; the e820
-check discounts trailing VADs when matching the RAM top.
 
 **The MMIO hole.** Page tables contain *guest-physical* addresses and Volatility's
 Intel layer reads the physical layer at that offset, so the dump must be laid out
@@ -100,9 +106,10 @@ translates — still works.
 
 **Where the hole's position comes from.** Not a constant: `_choose_hole_layout()`
 reads it from the Windows structures. Hyper-V's worker process allocates the guest's
-low-RAM block and high-RAM block as two separate private VADs, adjacent in host
-address space. In all three captures checked (kernels 5.15 and 6.18, three processes)
-the VADs were `0xf8000000` and `0x2ef600000` bytes, and the first VAD's size equals
+low-RAM block and high-RAM block as two separate private VADs (not always adjacent in
+host address space, see above). In the 15.5 GiB captures (kernels 5.15 and 6.18) the VADs
+were `0xf8000000` and `0x2ef600000` bytes, in the 6 GiB ones `0xf8000000` and
+`0x88000000`, in the 4 GiB one `0xf8000000` and `0x8000000`, and the low VAD's size equals
 the guest's low-RAM top exactly (`BIOS-e820` usable up to `0xf7ffffff`). High RAM then
 resumes at 4 GiB, so `hole = 4 GiB − size(first VAD)`. Guard rails: the first VAD must
 be between 3 GiB and 4 GiB (otherwise it is not "RAM below an MMIO gap" — e.g. a 2 GiB
@@ -119,16 +126,23 @@ scanned for the guest kernel's early boot-log lines
 `BIOS-e820: [mem 0x...-0x...] usable` (plain text in RAM, so no address translation
 is needed; a line split across two chunks is handled). Lines are grouped by proximity,
 because stale copies from earlier boots also sit in free memory (52 groups were found in
-one capture), and the layout counts as confirmed if *any* group agrees: the RAM top
-matches, and a low range ends where the hole starts while a high range begins where it
+one capture), and the layout counts as confirmed if *any* group agrees: the highest RAM
+address in the group equals our RAM top (so a high block we failed to include is caught,
+not ignored), and a low range ends where the hole starts while a high range begins where it
 ends. Otherwise the plugin warns, showing the distinct memory maps it did find. The check
 is informational only, is skipped when an existing dump is reused, and costs roughly
 13–30 s per 16 GiB.
 
-**Dump reuse.** `vmmemwsl.pid<PID>.dmp` is many GB. If a file with that name
-already exists *and* its size equals what would be written now (span size plus the
-hole), it is reused. Checking the size means a stale or partial file is never
-silently reused.
+**Dump reuse and provenance.** `vmmemwsl.pid<PID>.dmp` is many GB, so an existing one
+is reused - but name and size alone are not proof it came from *this* image: Windows
+reuses PIDs, and two captures of a same-sized guest give same-named, same-sized files
+with different contents (this silently analysed the wrong guest before the fix). So each
+dump gets a sidecar `<dump>.json` holding the Windows image (path, size, mtime), the
+process (PID and create time), the span and the hole layout. Reuse requires the file's
+size *and* the sidecar to match exactly. The sidecar is deleted before a dump starts and
+written only after it finishes, so an interrupted or truncated dump is never trusted; a
+dump with no sidecar (older versions) is re-written once; and if the image can't be
+fingerprinted (not a local file) nothing is reused.
 
 **Streaming.** The write loop reads 10 MB at a time with
 `proc_layer.read(offset, size, pad=True)`, so memory use is flat whatever the guest
@@ -299,11 +313,15 @@ Sampling 1 page in 64 across the span gave very different pictures:
 |---|---|---|---|
 | 15.5 GiB guest, fresh | ~83% | ~0% | ~17% |
 | 6 GiB guest, idle 9 hours | ~67% | ~22% | ~6% |
+| 6 GiB guest, fresh, VMware VM running alongside | ~67% | ~5% (+~2% other invalid) | ~27% |
 
 Zero PTEs do not affect in-use kernel structures. Paged-out pages can: on the 6 GiB
 capture PID 1's `task_struct` (guest-physical `0x100340000`) was in paging file 2, so
 `init_task.tasks.next` led to an all-zero page and `pslist` stopped after 11 tasks
-(`psscan`: 394). The pagefile index is `(PTE >> 1) & 0xF`; Volatility's Windows layer
+(`psscan`: 394). It is not only a matter of time: with a second VM competing for host
+memory, a freshly started guest lost enough pages (a guest page-table page at
+guest-physical `0x1058a5000` was non-resident) that the walk stopped after the 134
+kernel threads and never reached user processes. The pagefile index is `(PTE >> 1) & 0xF`; Volatility's Windows layer
 can resolve such pages from swap layers supplied with `--single-swap-locations`
 (`WinSwapLayers` numbers them in the order given, and the `n`-th layer serves paging
 file `n`), but whether this plugin's process layer picks them up is untested.

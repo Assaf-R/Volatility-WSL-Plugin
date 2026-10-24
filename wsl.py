@@ -28,8 +28,11 @@ This is one plugin, rather than one windows.wsl.<name> per Linux plugin, so that
 
 import sys
 import logging
+import json
 import os
 import re
+import urllib.parse
+import urllib.request
 from typing import Dict, List, NamedTuple, Optional, Tuple, Type
 
 from volatility3 import framework
@@ -143,6 +146,35 @@ def _choose_hole_layout(
     return _HoleLayout(0, 0, "guest RAM fits below the MMIO gap, so no hole")
 
 
+# Every vmmem process also holds a small fixed private VAD of exactly 32 MiB
+# (0x2000000 bytes in all eight captures examined). It is not guest RAM (the
+# guest's e820 map has no RAM for it), so a VAD this small is never taken as RAM.
+_MARKER_VAD_SIZE = 0x2000000
+
+
+def _select_ram_ranges(vad_ranges: List[Tuple[int, int]]) -> Tuple[List[Tuple[int, int]], str]:
+    """Chooses which VADs hold the guest's RAM, in guest-physical order.
+
+    vad_ranges: (host virtual start, size) of each VAD that has committed pages.
+
+    Hyper-V's worker allocates the guest's RAM as separate VADs: a low block
+    (0 .. below the MMIO hole, 0xF8000000 bytes on a guest of 3.875 GiB or more)
+    and a high block (from 4 GiB up). They are NOT reliably adjacent in host
+    memory - in a 4 GiB guest the 128 MiB high block sat *below* the low block,
+    which merging "adjacent VADs" missed - so VADs are chosen by what they are:
+    the one 3-4 GiB block is the low RAM and goes first, any other sizeable VAD
+    is higher RAM and follows in address order. A guest smaller than 3.875 GiB
+    has only the low block, which is then simply the biggest VAD.
+    """
+    big = [r for r in vad_ranges if r[1] > _MARKER_VAD_SIZE] or list(vad_ranges)
+    low = [r for r in big if _MIN_LOW_RAM_BLOCK <= r[1] < _FOUR_GIB]
+    if low and len(big) >= 2:
+        first = max(low, key=lambda r: r[1])
+        rest = sorted((r for r in big if r != first), key=lambda r: r[0])
+        return [first] + rest, "the 3-4 GiB low-RAM VAD first, then the other RAM VADs by address"
+    return sorted(big, key=lambda r: r[0]), "committed VADs in address order"
+
+
 class _E820Scanner:
     """Collects the guest kernel's own record of its physical memory map.
 
@@ -197,46 +229,31 @@ class _E820Scanner:
             last = off
         return groups
 
-    def verify(
-        self, layout: _HoleLayout, span_size: int, vad_sizes: Optional[List[int]] = None
-    ) -> Tuple[str, str]:
+    def verify(self, layout: _HoleLayout, total_ram: int) -> Tuple[str, str]:
         """Returns (status, message); status is confirmed / contradicted / not_found.
 
-        A VAD that merely sits next to the RAM in host memory (a 32 MiB one did,
-        in a 2 GiB guest) is merged into the span but is not guest RAM, so the
-        RAM top may also be reached by discounting that many trailing VADs.
+        The guest's RAM must end exactly where our layout says it does: a group
+        that also lists RAM *above* our top (e.g. a high block we failed to
+        include) does not match.
         """
         groups = self._groups()
         if not groups:
             return "not_found", "no e820 boot-log lines found in the dump"
-        full_top = span_size + layout.size  # last guest-physical address + 1
-        sizes = vad_sizes or []
-        # (RAM top, number of trailing non-RAM VADs discounted)
-        tops = [(full_top, 0)] + [
-            (full_top - sum(sizes[len(sizes) - k :]), k) for k in range(1, len(sizes))
-        ]
+        top = total_ram + layout.size  # last guest-physical address + 1
         for g in groups:
             ends = {e + 1 for _, e in g}
             starts = {s for s, _ in g}
-            for top, extra in tops:
-                if top not in ends:
-                    continue
-                if layout.size == 0 or (
-                    layout.start in ends and layout.start + layout.size in starts
-                ):
-                    return "confirmed", (
-                        "the guest's own e820 memory map matches "
-                        f"(RAM up to {top:#x}"
-                        + (f", hole {layout.start:#x}-{layout.start + layout.size:#x}" if layout.size else "")
-                        + ")"
-                        + (
-                            f"; the last {extra} VAD(s) in the span ({full_top - top:#x} bytes) "
-                            "lie beyond the guest's RAM and are harmless trailing data"
-                            if extra
-                            else ""
-                        )
-                    )
-        top = full_top
+            if max(ends) != top:
+                continue
+            if layout.size == 0 or (
+                layout.start in ends and layout.start + layout.size in starts
+            ):
+                return "confirmed", (
+                    "the guest's own e820 memory map matches "
+                    f"(RAM up to {top:#x}"
+                    + (f", hole {layout.start:#x}-{layout.start + layout.size:#x}" if layout.size else "")
+                    + ")"
+                )
         # The same boot log is often present many times (copies in free memory,
         # page cache, ...), so show each *distinct* memory map once.
         distinct = list(dict.fromkeys(tuple(g) for g in groups))
@@ -247,7 +264,8 @@ class _E820Scanner:
             f"none of the {len(groups)} e820 record group(s) found matches the chosen "
             f"layout (RAM top {top:#x}, hole {layout.start:#x}+{layout.size:#x}): {shown}. "
             "They may be stale copies from earlier boots; if pslist/bash come back "
-            "empty while psscan works, override with --mmio-hole START:SIZE."
+            "empty while psscan works, a RAM block may be missing or the layout wrong - "
+            "override with --mmio-hole START:SIZE."
         )
 
 
@@ -297,6 +315,47 @@ def _linux_plugin_name_from_argv() -> Optional[str]:
         if arg.startswith("--linux-plugin="):
             return arg.split("=", 1)[1]
     return None
+
+
+# --- Dump provenance -------------------------------------------------------
+# A guest-RAM dump is many GB, so an existing one is reused instead of re-written.
+# The filename (vmmemwsl.pid<PID>.dmp) and size are NOT enough to prove it came
+# from the image being analysed: Windows reuses PIDs, and two captures of the
+# same-sized guest give same-named, same-sized files with different contents.
+# So each dump gets a sidecar "<dump>.json" recording where it came from (image
+# path + size + mtime, process, create time, span and layout), written only after
+# the dump completes, and reuse requires the sidecar to match exactly. A dump with
+# no sidecar (older versions, an interrupted run) is never trusted.
+def _sidecar_path(dump_path: str) -> str:
+    return dump_path + ".json"
+
+
+def _image_fingerprint(location: Optional[str]) -> Dict[str, object]:
+    """Identifies the Windows image being analysed (path, size, mtime).
+
+    If the image isn't a local file we can stat (a URL, a multi-file image, ...)
+    the fingerprint is flagged `unverifiable` and a dump made from it is never
+    reused, because nothing could prove a later image is the same one.
+    """
+    info: Dict[str, object] = {"image": location}
+    try:
+        parsed = urllib.parse.urlparse(location or "")
+        if parsed.scheme != "file":
+            raise ValueError("not a local file")
+        st = os.stat(urllib.request.url2pathname(parsed.path))
+        info["image_size"] = st.st_size
+        info["image_mtime_ns"] = st.st_mtime_ns
+    except (ValueError, OSError):
+        info["unverifiable"] = True
+    return info
+
+
+def _proc_name(proc) -> str:
+    """Lower-cased ImageFileName of a Windows process object."""
+    try:
+        return utility.array_to_string(proc.ImageFileName).lower()
+    except Exception:
+        return str(getattr(proc, "ImageFileName", "")).lower()
 
 
 class linux_plugins(interfaces.plugins.PluginInterface):
@@ -424,15 +483,17 @@ class linux_plugins(interfaces.plugins.PluginInterface):
         self,
         proc_layer: interfaces.layers.DataLayerInterface,
         pid: int,
-        span_start: int,
-        span_end: int,
+        ranges: List[Tuple[int, int]],
         dest_path: str,
         progress_label: str,
         layout: Optional[_HoleLayout] = None,
         scanner: Optional[_E820Scanner] = None,
+        identity: Optional[Dict[str, object]] = None,
     ) -> str:
-        """Streams one [span_start, span_end] host-VA range out to dest_path,
-        reusing an existing file of the right size instead of re-writing it.
+        """Streams the given (host start, size) ranges, back to back in the
+        order given, out to dest_path, reusing an existing file instead of re-writing it - but only if its
+        provenance sidecar matches `identity` exactly (see "Dump provenance"
+        above); without an identity nothing is ever reused.
 
         Shared by the main guest-memory span (always dumped) and, optionally,
         every other span found in the process (see `dump_extra_regions`).
@@ -443,23 +504,43 @@ class linux_plugins(interfaces.plugins.PluginInterface):
         meaningful for the main RAM span. If a `scanner` is given, every chunk
         written is fed to it (it is not fed when an existing dump is reused).
         """
-        span_size = span_end - span_start + 1
+        span_size = sum(size for _, size in ranges)
         hole_start = layout.start if layout else 0
         hole = layout.size if layout else 0
         out_size = span_size + hole
 
-        # See the reuse comment in the caller for why we key on size too, not
-        # just the filename existing.
-        if os.path.exists(dest_path) and os.path.getsize(dest_path) == out_size:
-            vollog.info(
-                f"Reusing existing dump {dest_path} for PID {pid} "
-                f"({out_size:,} bytes matches this span) - skipping re-dump"
-            )
-            return dest_path
+        sidecar = _sidecar_path(dest_path)
+        record = dict(identity, dump_size=out_size) if identity is not None else None
+        if os.path.exists(dest_path):
+            reusable = False
+            reason = "it has no provenance record (older version or interrupted run)"
+            if record is None or record.get("unverifiable"):
+                reason = "the source image can't be verified"
+            elif os.path.getsize(dest_path) != out_size:
+                reason = "its size differs from this span"
+            elif os.path.exists(sidecar):
+                try:
+                    with open(sidecar, "r", encoding="utf-8") as fh:
+                        reusable = json.load(fh) == record
+                except (OSError, ValueError):
+                    pass
+                reason = "it was made from a different image, process or layout"
+            if reusable:
+                vollog.info(
+                    f"Reusing existing dump {dest_path} for PID {pid} "
+                    f"({out_size:,} bytes, provenance matches) - skipping re-dump"
+                )
+                return dest_path
+            vollog.info(f"Not reusing existing {dest_path}: {reason}; re-dumping")
+
+        # Until the dump completes there must be no record claiming it is whole.
+        if os.path.exists(sidecar):
+            os.remove(sidecar)
 
         vollog.info(f"Dumping {out_size:,} bytes to {dest_path}")
 
-        written = 0  # bytes consumed from the host span (excludes the hole)
+        written = 0  # bytes of RAM consumed so far (excludes the hole)
+        ri, roff = 0, 0  # which host range we are in, and how far into it
         with open(dest_path, "wb") as fh:
             while written < span_size:
                 if hole and written == hole_start:
@@ -471,20 +552,48 @@ class linux_plugins(interfaces.plugins.PluginInterface):
                         fh.write(bytes(n))
                         left -= n
                     hole = 0
-                to_read = min(_DUMP_CHUNK_SIZE, span_size - written)
+                rstart, rsize = ranges[ri]
+                # never let a chunk straddle the end of a host range ...
+                to_read = min(_DUMP_CHUNK_SIZE, span_size - written, rsize - roff)
                 if hole and written < hole_start:
-                    # never let a chunk straddle the insertion point
+                    # ... or the hole's insertion point
                     to_read = min(to_read, hole_start - written)
                 # pad=True: fill any unmapped/unavailable pages with zeros
                 # rather than aborting the dump, same as vadinfo/memmap do.
-                data = proc_layer.read(span_start + written, to_read, pad=True)
+                data = proc_layer.read(rstart + roff, to_read, pad=True)
                 fh.write(data)
                 if scanner is not None:
                     scanner.feed(data, written)
                 written += to_read
+                roff += to_read
+                if roff == rsize:
+                    ri, roff = ri + 1, 0
                 self._progress_callback(written * 100 // span_size, progress_label)
 
+        # Written last, so its presence means the dump above finished.
+        if record is not None and not record.get("unverifiable"):
+            with open(sidecar, "w", encoding="utf-8") as fh:
+                json.dump(record, fh, indent=1)
+
         return dest_path
+
+    def _capture_identity(self, proc: interfaces.objects.ObjectInterface) -> Dict[str, object]:
+        """Who/what a dump belongs to: the Windows image plus this process
+        (PID and create time, since Windows reuses PIDs)."""
+        location = None
+        try:
+            kernel_layer = self.context.layers[proc.vol.layer_name]
+            phys = self.context.layers[kernel_layer.config["memory_layer"]]
+            location = getattr(phys, "location", None)
+        except (KeyError, AttributeError, exceptions.LayerException):
+            pass
+        info = _image_fingerprint(location)
+        info["pid"] = int(proc.UniqueProcessId)
+        try:
+            info["create_time"] = str(proc.get_create_time())
+        except Exception:  # unreadable/odd value: still better than nothing
+            info["create_time"] = "unknown"
+        return info
 
     def _dump_guest_memory(self, proc: interfaces.objects.ObjectInterface) -> str:
         """Dumps the VAD run backing the guest's physical RAM to a flat file
@@ -506,29 +615,13 @@ class linux_plugins(interfaces.plugins.PluginInterface):
                 f"Process {pid} has no VADs - can't locate its guest memory region"
             )
 
-        # Heuristic: Hyper-V exposes a lightweight VM's guest-physical RAM as
-        # a *set* of VADs inside its host worker process, not always a single
-        # one - on real hardware-like layouts, RAM below the ~4GiB PCI/MMIO
-        # hole and RAM above it commonly end up as separate VAD allocations.
-        # Critically, the "low memory" portion (where the kernel image, and
-        # thus symbols like the boot banner, actually load) can land in the
-        # *smaller* of these, not the biggest one - so picking only the
-        # single largest VAD can silently miss it, even though the biggest
-        # VAD alone is still multiple GB and "looks" like the whole guest.
-        #
-        # Whenever Hyper-V splits guest RAM this way, the pieces are laid out
-        # host-VA-contiguously (one VAD's end+1 == the next VAD's start),
-        # which is exactly what lets us tell "parts of one guest-physical
-        # range" apart from "an unrelated allocation that happens to be
-        # large" (a big stack/heap region elsewhere in the process): we merge
-        # every run of host-VA-adjacent VADs into one span and use the
-        # largest resulting span, rather than the largest single VAD.
-        #
-        # Only VADs with committed pages are candidates. Every vmmem process
-        # also carries a ~4 GiB PAGE_NOACCESS *reservation* (0x10000-0xffffffff,
-        # zero commit charge) that holds no data; without this filter it would
-        # out-size the RAM of any guest under ~4 GiB and be dumped instead
-        # (seen with a 2 GiB guest). If nothing is committed, fall back to all.
+        # Which VADs are the guest's RAM? Hyper-V's worker allocates the low-RAM
+        # block and the high-RAM block (above 4 GiB) as separate VADs - see
+        # _select_ram_ranges. Only VADs with committed pages are candidates:
+        # every vmmem process also carries a ~4 GiB PAGE_NOACCESS *reservation*
+        # (0x10000-0xffffffff, zero commit charge) that holds no data, and it
+        # would out-size the RAM of a guest under ~4 GiB (seen with a 2 GiB
+        # guest). If nothing is committed, fall back to all VADs.
         def _commit(vad) -> int:
             try:
                 return int(vad.get_commit_charge())
@@ -536,51 +629,40 @@ class linux_plugins(interfaces.plugins.PluginInterface):
                 return 1  # can't tell: don't exclude it
 
         candidates = [v for v in vads if _commit(v) > 0] or vads
-        vads_by_start = sorted(candidates, key=lambda v: v.get_start())
-        spans = []  # list of [start, end, [vads...]]
-        for vad in vads_by_start:
-            start, end = vad.get_start(), vad.get_end()
-            if spans and spans[-1][1] + 1 == start:
-                spans[-1][1] = end
-                spans[-1][2].append(vad)
-            else:
-                spans.append([start, end, [vad]])
-
-        main_span = max(spans, key=lambda s: s[1] - s[0])
-        span_start, span_end, span_vads = main_span
+        vad_ranges = [(v.get_start(), v.get_end() - v.get_start() + 1) for v in candidates]
+        ranges, how = _select_ram_ranges(vad_ranges)
+        vad_sizes = [size for _, size in ranges]
+        span_size = sum(vad_sizes)
         vollog.info(
-            f"PID {pid}: treating host-VA-contiguous span {span_start:#x}-"
-            f"{span_end:#x} ({span_end - span_start + 1:,} bytes, merged from "
-            f"{len(span_vads)} VAD(s)) as the WSL guest's physical memory"
+            f"PID {pid}: guest RAM = {len(ranges)} VAD(s) ({how}): "
+            + ", ".join(f"{start:#x}+{size:#x}" for start, size in ranges)
         )
 
-        span_size = span_end - span_start + 1
-        # span_vads is already in address order (built from the sorted list).
-        vad_sizes = [v.get_end() - v.get_start() + 1 for v in span_vads]
         layout = _choose_hole_layout(vad_sizes, span_size, self.config.get("mmio_hole"))
         vollog.info(
-            f"PID {pid}: VAD sizes {[hex(s) for s in vad_sizes]}; MMIO hole "
-            + (
-                f"{layout.start:#x}+{layout.size:#x}"
-                if layout.size
-                else "none"
-            )
+            f"PID {pid}: MMIO hole "
+            + (f"{layout.start:#x}+{layout.size:#x}" if layout.size else "none")
             + f" ({layout.source})"
         )
 
         dest_path = os.path.join(os.getcwd(), f"vmmemwsl.pid{pid}.dmp")
         scanner = _E820Scanner()
-        # This is the span the wrapped Linux plugin will actually be run
+        base_identity = self._capture_identity(proc)
+        # This is the memory the wrapped Linux plugin will actually be run
         # against, so a failure dumping it is fatal - let it raise.
         self._dump_span(
             proc_layer,
             pid,
-            span_start,
-            span_end,
+            ranges,
             dest_path,
             f"Dumping WSL guest memory (PID {pid})",
             layout=layout,
             scanner=scanner,
+            identity=dict(
+                base_identity,
+                ranges=[list(r) for r in ranges],
+                hole=[layout.start, layout.size],
+            ),
         )
 
         # Cross-check the layout against the guest's own memory map. Never
@@ -589,7 +671,7 @@ class linux_plugins(interfaces.plugins.PluginInterface):
         if scanner.bytes_fed != span_size:
             vollog.info("Reused an existing dump, so the e820 layout check was skipped")
         else:
-            status, detail = scanner.verify(layout, span_size, vad_sizes)
+            status, detail = scanner.verify(layout, span_size)
             if status == "confirmed":
                 vollog.info(f"MMIO layout check: {detail}")
             elif status == "not_found":
@@ -598,28 +680,32 @@ class linux_plugins(interfaces.plugins.PluginInterface):
                 vollog.warning(f"MMIO layout check: {detail}")
 
         if self.config.get("dump_extra_regions"):
-            extra_spans = [s for s in spans if s is not main_span]
-            for i, (extra_start, extra_end, extra_vads) in enumerate(extra_spans, 1):
+            extras = [r for r in vad_ranges if r not in ranges]
+            for i, (extra_start, extra_size) in enumerate(extras, 1):
                 extra_path = os.path.join(
                     os.getcwd(),
-                    f"vmmemwsl.pid{pid}.extra{i}.{extra_start:#x}-{extra_end:#x}.dmp",
+                    f"vmmemwsl.pid{pid}.extra{i}.{extra_start:#x}-{extra_start + extra_size - 1:#x}.dmp",
                 )
                 # Best-effort: these are bonus data for manual follow-up, not
                 # needed for the actual plugin run, so one failing (disk
                 # space, an unreadable VAD, whatever) shouldn't take down a
-                # run that has already gotten the main span it actually needs.
+                # run that has already gotten the memory it actually needs.
                 try:
                     self._dump_span(
                         proc_layer,
                         pid,
-                        extra_start,
-                        extra_end,
+                        [(extra_start, extra_size)],
                         extra_path,
-                        f"Dumping extra WSL region {i}/{len(extra_spans)} (PID {pid})",
+                        f"Dumping extra WSL region {i}/{len(extras)} (PID {pid})",
+                        identity=dict(
+                            base_identity,
+                            ranges=[[extra_start, extra_size]],
+                            hole=[0, 0],
+                        ),
                     )
                 except Exception as excp:
                     vollog.warning(
-                        f"Couldn't dump extra region {extra_start:#x}-{extra_end:#x} "
+                        f"Couldn't dump extra region {extra_start:#x}+{extra_size:#x} "
                         f"for PID {pid}: {excp}"
                     )
 
@@ -673,11 +759,13 @@ class linux_plugins(interfaces.plugins.PluginInterface):
                 self._file_handler,
             )
         except exceptions.UnsatisfiedException as excp:
-            vollog.error(
+            # Not logged here: run() may still have another candidate to try,
+            # and only reports the failure once it runs out of them.
+            excp.args = (
                 f"{target_cls.__module__}.{target_cls.__name__} couldn't be "
                 f"satisfied against the dumped WSL memory: {list(excp.unsatisfied)}. "
                 "Do you have a matching Linux ISF for this WSL kernel installed "
-                "under volatility3/symbols/linux/?"
+                "under volatility3/symbols/linux/?",
             )
             raise
 
@@ -700,8 +788,14 @@ class linux_plugins(interfaces.plugins.PluginInterface):
 
         candidates = self._find_wsl_candidates()
 
+        # "vmmem" is also the name other lightweight VMs (Windows Sandbox, ...)
+        # run under, so try the process literally named vmmemWSL first. The sort
+        # is stable, so process-list order is kept within each group.
+        candidates = sorted(candidates, key=lambda p: _proc_name(p) != "vmmemwsl")
+
         last_error: Optional[Exception] = None
-        for proc in candidates:
+        unanalysable: Optional[exceptions.UnsatisfiedException] = None
+        for n, proc in enumerate(candidates):
             try:
                 dump_path = self._dump_guest_memory(proc)
             except exceptions.PluginRequirementException as excp:
@@ -714,7 +808,28 @@ class linux_plugins(interfaces.plugins.PluginInterface):
                 )
                 last_error = excp
                 continue
-            return self._run_linux_plugin(dump_path)
+            try:
+                return self._run_linux_plugin(dump_path)
+            except exceptions.UnsatisfiedException as excp:
+                # This process's memory has no Linux guest we can analyse: no
+                # matching ISF, or it isn't a Linux VM at all (another vmmem).
+                # Remembered separately so a later stale candidate's "no VADs"
+                # can't hide it: it's the more useful thing to tell the user.
+                unanalysable = excp
+                if n < len(candidates) - 1:
+                    vollog.warning(
+                        f"PID {proc.UniqueProcessId}: {excp} Trying the next "
+                        "candidate WSL process."
+                    )
+                    continue
+                vollog.error(str(excp))
+                raise
+
+        # Every candidate failed. If an earlier one dumped fine but wasn't
+        # analysable, that - not "no usable memory" - is the real problem.
+        if unanalysable is not None:
+            vollog.error(str(unanalysable))
+            raise unanalysable
 
         msg = (
             f"None of the {len(candidates)} candidate WSL process(es) found "
