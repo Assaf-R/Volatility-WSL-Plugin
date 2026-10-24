@@ -22,7 +22,8 @@ so `vol.py -h` shows a single entry for the whole family.
 | `_linux_plugin_name_from_argv()` | Reads `--linux-plugin X` / `--linux-plugin=X` from `sys.argv`. See §1.2. |
 
 Constants: `WSL_PROCESS_NAMES` (`vmmemwsl`, `vmmem`), `_DUMP_CHUNK_SIZE` (10 MB),
-and `_GUEST_MMIO_HOLE_START/_SIZE` (`0xF8000000`, 128 MiB; see §1.4).
+and `_DEFAULT_HOLE_START/_SIZE` (`0xF8000000`, 128 MiB; the fallback if the layout can't be
+detected, see §1.4).
 
 ### 1.2 `get_requirements()`
 
@@ -75,18 +76,54 @@ for vad in sorted(vads, key=lambda v: v.get_start()):
 Host-VA adjacency ties the VADs together as one physical range; an unrelated big
 allocation elsewhere in the process won't sit exactly end to end with guest RAM.
 
+**Only committed VADs are candidates.** Every `vmmemWSL` process also carries a ~4 GiB
+`PAGE_NOACCESS` reservation (`0x10000-0xffffffff`, commit charge 0) that holds no data.
+On the 15.5 GiB guests the RAM out-sizes it, but on a 2 GiB guest the reservation is the
+"largest span" and was dumped instead (an empty 4 GiB file, then "ISF not satisfied"). So
+VADs with a commit charge of 0 are ignored (falling back to all VADs if none is committed).
+A 32 MiB VAD that is always present can end up host-adjacent to the RAM (it did on the
+2 GiB guest), in which case it is merged into the span as harmless trailing data; the e820
+check discounts trailing VADs when matching the RAM top.
+
 **The MMIO hole.** Page tables contain *guest-physical* addresses and Volatility's
 Intel layer reads the physical layer at that offset, so the dump must be laid out
 by guest-physical address. The guest's map is RAM at `0 .. 0xF8000000`, a 128 MiB
 device hole, then RAM again from `0x100000000`. The host maps only the RAM, back to
-back, so above 4 GiB the span is 128 MiB "short". `_dump_span(insert_mmio_hole=True)`
-writes 128 MiB of zeros at `0xF8000000`, restoring *file offset == guest-physical
-address*. This was measured, not assumed: a guest page-directory page at
+back, so above 4 GiB the span is 128 MiB "short". `_dump_span(layout=...)`
+writes that many zeros at the hole's start (`0xF8000000` on the tested guests),
+restoring *file offset == guest-physical address*. This was measured, not assumed: a guest page-directory page at
 guest-physical `0x1012b7000` was found in the span at `0xF92B7000`
 (= gpa − `0x8000000`) and contained valid direct-map entries. Without the hole,
 every page-table walk above 4 GiB reads the wrong page (zeros) and every plugin
 that translates virtual addresses returns nothing, while `psscan` — which never
 translates — still works.
+
+**Where the hole's position comes from.** Not a constant: `_choose_hole_layout()`
+reads it from the Windows structures. Hyper-V's worker process allocates the guest's
+low-RAM block and high-RAM block as two separate private VADs, adjacent in host
+address space. In all three captures checked (kernels 5.15 and 6.18, three processes)
+the VADs were `0xf8000000` and `0x2ef600000` bytes, and the first VAD's size equals
+the guest's low-RAM top exactly (`BIOS-e820` usable up to `0xf7ffffff`). High RAM then
+resumes at 4 GiB, so `hole = 4 GiB − size(first VAD)`. Guard rails: the first VAD must
+be between 3 GiB and 4 GiB (otherwise it is not "RAM below an MMIO gap" — e.g. a 2 GiB
+guest split in two 1 GiB VADs must *not* get a hole); a single VAD larger than
+`0xF8000000` falls back to the default 128 MiB at `0xF8000000` with a warning; a guest
+that fits below the gap gets no hole. `--mmio-hole START:SIZE|none` overrides all of it.
+
+The VADs are only what the user-mode worker allocated; the authoritative
+guest-physical-to-host-address table lives in the Hyper-V Virtualization
+Infrastructure Driver (`vid.sys`), which this plugin does not parse.
+
+**Cross-check (`_E820Scanner`).** While each 10 MB chunk is written, it is also
+scanned for the guest kernel's early boot-log lines
+`BIOS-e820: [mem 0x...-0x...] usable` (plain text in RAM, so no address translation
+is needed; a line split across two chunks is handled). Lines are grouped by proximity,
+because stale copies from earlier boots also sit in free memory (52 groups were found in
+one capture), and the layout counts as confirmed if *any* group agrees: the RAM top
+matches, and a low range ends where the hole starts while a high range begins where it
+ends. Otherwise the plugin warns, showing the distinct memory maps it did find. The check
+is informational only, is skipped when an existing dump is reused, and costs roughly
+13–30 s per 16 GiB.
 
 **Dump reuse.** `vmmemwsl.pid<PID>.dmp` is many GB. If a file with that name
 already exists *and* its size equals what would be written now (span size plus the
@@ -232,8 +269,11 @@ layout shows up.
 symbols (`fair_sched_class`, ...) and builds `task_struct` objects directly on the
 physical layer. No pointer chasing means no translation. That makes it the fastest
 sanity check of a new ISF: if psscan finds processes the ISF's addresses are right;
-if `psscan` works but `pslist` is empty, suspect the dump layout (the MMIO hole)
-or a page-table problem instead.
+if `psscan` works but `pslist` is empty or short, suspect (a) the dump layout (the
+MMIO hole), (b) a page-table problem, or (c) pages Windows has paged out (§3.6), which
+read as zeros and stop any pointer walk at the first one. Telling (a) from (c): walk the
+first failing pointer by hand and ask the Windows process layer what state that page's
+PTE is in.
 
 ### 3.6 The Windows side
 
@@ -244,6 +284,26 @@ address space. `_dump_guest_memory()` reads through it to pull guest RAM into a
 flat file, which becomes the physical layer of the second, Linux-side context. Two
 independent layer stacks are chained only by a file on disk.
 
-Most of a large guest's span shows as never-mapped (zero PTE) in Windows — unused
-guest RAM that was never touched or was returned to the host. That is normal and
-does not affect in-use kernel structures.
+**What the Windows page-table entries say about guest RAM.** Reading the span through
+the process layer, each page is in one of these states:
+
+| State | Meaning | In the dump |
+|---|---|---|
+| Valid / transition | resident (transition = trimmed but still in RAM) | readable |
+| Zero PTE | never touched, or returned to the host | zeros; normal for unused guest RAM |
+| Paged out (`SwappedInvalidAddressException`) | written to a Windows paging file | **missing**, read as zeros by `pad=True` |
+
+Sampling 1 page in 64 across the span gave very different pictures:
+
+| Capture | Zero PTE | Paged out | Readable |
+|---|---|---|---|
+| 15.5 GiB guest, fresh | ~83% | ~0% | ~17% |
+| 6 GiB guest, idle 9 hours | ~67% | ~22% | ~6% |
+
+Zero PTEs do not affect in-use kernel structures. Paged-out pages can: on the 6 GiB
+capture PID 1's `task_struct` (guest-physical `0x100340000`) was in paging file 2, so
+`init_task.tasks.next` led to an all-zero page and `pslist` stopped after 11 tasks
+(`psscan`: 394). The pagefile index is `(PTE >> 1) & 0xF`; Volatility's Windows layer
+can resolve such pages from swap layers supplied with `--single-swap-locations`
+(`WinSwapLayers` numbers them in the order given, and the `n`-th layer serves paging
+file `n`), but whether this plugin's process layer picks them up is untested.

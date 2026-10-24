@@ -29,7 +29,8 @@ This is one plugin, rather than one windows.wsl.<name> per Linux plugin, so that
 import sys
 import logging
 import os
-from typing import Dict, List, Optional, Type
+import re
+from typing import Dict, List, NamedTuple, Optional, Tuple, Type
 
 from volatility3 import framework
 from volatility3.framework import (
@@ -56,18 +57,198 @@ WSL_PROCESS_NAMES = {"vmmemwsl", "vmmem"}
 # memory usage flat regardless of how many GB the guest was configured with.
 _DUMP_CHUNK_SIZE = 10 * 1024 * 1024
 
-# The WSL2 (Hyper-V) guest's physical address map has a 128 MiB MMIO hole just
-# below 4 GiB: RAM is at guest-physical 0 .. 0xF8000000, then nothing (device
-# space) until 0x100000000, where the rest of RAM resumes. The host maps only
-# the RAM, back to back, so in vmmemWSL's VAD run the "high" RAM starts right
-# after the low RAM, i.e. 128 MiB earlier than its guest-physical address.
+# --- The guest's MMIO hole -------------------------------------------------
+# The WSL2 (Hyper-V) guest's physical address map has an MMIO hole just below
+# 4 GiB: RAM at guest-physical 0 .. 0xF8000000, then nothing (device space)
+# until 0x100000000, where the rest of RAM resumes. The host maps only the
+# RAM, back to back, so in vmmemWSL's VAD run the "high" RAM starts right after
+# the low RAM, i.e. one hole-size earlier than its guest-physical address.
 # Every physical address the guest writes into its page tables is a *guest*
 # address, so to make "file offset == guest-physical address" (which is what
 # Volatility's Intel layer assumes) we re-insert the missing hole as zeros.
 # Measured, not assumed: guest PD pages at gpa 0x1012b7000 were found at span
 # offset 0xF92B7000 (= gpa - 0x8000000) and hold valid direct-map entries.
-_GUEST_MMIO_HOLE_START = 0xF8000000
-_GUEST_MMIO_HOLE_SIZE = 0x8000000
+#
+# Where the layout comes from (in order of preference):
+#   1. --mmio-hole START:SIZE (or "none"), if the user gave it.
+#   2. The Windows VAD structure: Hyper-V's worker allocates the low-RAM block
+#      and the high-RAM block as two separate, host-adjacent VADs, so the
+#      size of the first VAD *is* where the hole starts, and the high block
+#      resumes at 4 GiB. Seen identically in all three captures tested.
+#   3. The built-in default below, with a warning, when the VADs don't show it.
+# Afterwards the result is cross-checked against the guest kernel's own
+# "BIOS-e820" boot-log lines found in the RAM we are dumping (_E820Scanner).
+_DEFAULT_HOLE_START = 0xF8000000
+_DEFAULT_HOLE_SIZE = 0x8000000
+_FOUR_GIB = 1 << 32
+# A believable low-RAM block is 3 GiB .. just under 4 GiB; anything outside
+# that is not "RAM below an MMIO gap" and must not be turned into a hole.
+_MIN_LOW_RAM_BLOCK = 3 * (1 << 30)
+
+
+class _HoleLayout(NamedTuple):
+    start: int  # guest-physical address (== span offset) where the hole begins
+    size: int  # bytes of zeros to insert there; 0 means "no hole"
+    source: str  # where this came from, for the log
+
+
+def _parse_hole_override(text: str) -> _HoleLayout:
+    """Parses --mmio-hole: "none", or "START:SIZE" (ints, 0x... allowed)."""
+    t = text.strip().lower()
+    if t == "none":
+        return _HoleLayout(0, 0, "--mmio-hole none")
+    try:
+        start_s, size_s = t.split(":")
+        start, size = int(start_s, 0), int(size_s, 0)
+        if start <= 0 or size < 0:
+            raise ValueError
+    except ValueError:
+        raise exceptions.PluginRequirementException(
+            f"--mmio-hole must be 'none' or START:SIZE (e.g. 0xF8000000:0x8000000), got {text!r}"
+        )
+    return _HoleLayout(start, size, f"--mmio-hole {text}")
+
+
+def _choose_hole_layout(
+    vad_sizes: List[int], span_size: int, override: Optional[str]
+) -> _HoleLayout:
+    """Decides where (if anywhere) to re-insert the guest's MMIO hole.
+
+    vad_sizes: sizes of the VADs forming the guest-RAM span, in address order.
+    """
+    if override:
+        return _parse_hole_override(override)
+
+    # The low-RAM VAD ends exactly where the hole starts, and the next block of
+    # RAM resumes at 4 GiB (verified against the guest's e820 map, see below).
+    if len(vad_sizes) >= 2 and _MIN_LOW_RAM_BLOCK <= vad_sizes[0] < _FOUR_GIB:
+        low = vad_sizes[0]
+        return _HoleLayout(
+            low,
+            _FOUR_GIB - low,
+            "boundary between the first two RAM VADs (high RAM resumes at 4 GiB)",
+        )
+
+    if span_size > _DEFAULT_HOLE_START:
+        vollog.warning(
+            "The VAD layout does not show where the guest's MMIO hole is; "
+            f"assuming the usual {_DEFAULT_HOLE_SIZE >> 20} MiB hole at "
+            f"{_DEFAULT_HOLE_START:#x}. If pslist/bash come back empty while "
+            "psscan works, override it with --mmio-hole START:SIZE."
+        )
+        return _HoleLayout(
+            _DEFAULT_HOLE_START, _DEFAULT_HOLE_SIZE, "built-in default (VADs gave no hint)"
+        )
+
+    return _HoleLayout(0, 0, "guest RAM fits below the MMIO gap, so no hole")
+
+
+class _E820Scanner:
+    """Collects the guest kernel's own record of its physical memory map.
+
+    Early in boot Linux prints lines such as
+        BIOS-e820: [mem 0x0000000100000000-0x00000003ef5fffff] usable
+    into its log buffer, which sits in plain text in the RAM we are dumping.
+    Fed every chunk as it is written out, this finds them for free (no address
+    translation needed) so the layout we chose can be checked against what the
+    guest itself says. Stale copies from earlier boots also turn up in free
+    memory, so lines are grouped by proximity and *any* matching group is enough.
+    """
+
+    _LINE = re.compile(
+        rb"BIOS-e820: \[mem 0x([0-9a-f]{16})-0x([0-9a-f]{16})\] usable"
+    )
+    _TAIL = 96  # longer than one line, so a line split across chunks is still seen
+
+    def __init__(self) -> None:
+        self.hits: Dict[int, Tuple[int, int]] = {}  # span offset -> (start, end)
+        self.bytes_fed = 0
+        self._tail = b""
+
+    def feed(self, data: bytes, offset: int) -> None:
+        # A line can straddle two chunks, so also scan the previous chunk's tail
+        # joined to this chunk's head. Doing that on small slices (not a copy of
+        # the whole chunk) keeps the scan cheap; hits are keyed by absolute
+        # offset, so a line seen twice is stored once.
+        if self._tail:
+            join = self._tail + data[: self._TAIL]
+            self._add(join, offset - len(self._tail))
+        if b"BIOS-e820" in data:
+            self._add(data, offset)
+        # (a chunk shorter than the tail must not push older tail bytes out)
+        self._tail = (
+            data[-self._TAIL :]
+            if len(data) >= self._TAIL
+            else (self._tail + data)[-self._TAIL :]
+        )
+        self.bytes_fed += len(data)
+
+    def _add(self, buf: bytes, base: int) -> None:
+        for m in self._LINE.finditer(buf):
+            self.hits[base + m.start()] = (int(m.group(1), 16), int(m.group(2), 16))
+
+    def _groups(self) -> List[List[Tuple[int, int]]]:
+        groups: List[List[Tuple[int, int]]] = []
+        last = None
+        for off in sorted(self.hits):
+            if last is None or off - last > 4096:
+                groups.append([])
+            groups[-1].append(self.hits[off])
+            last = off
+        return groups
+
+    def verify(
+        self, layout: _HoleLayout, span_size: int, vad_sizes: Optional[List[int]] = None
+    ) -> Tuple[str, str]:
+        """Returns (status, message); status is confirmed / contradicted / not_found.
+
+        A VAD that merely sits next to the RAM in host memory (a 32 MiB one did,
+        in a 2 GiB guest) is merged into the span but is not guest RAM, so the
+        RAM top may also be reached by discounting that many trailing VADs.
+        """
+        groups = self._groups()
+        if not groups:
+            return "not_found", "no e820 boot-log lines found in the dump"
+        full_top = span_size + layout.size  # last guest-physical address + 1
+        sizes = vad_sizes or []
+        # (RAM top, number of trailing non-RAM VADs discounted)
+        tops = [(full_top, 0)] + [
+            (full_top - sum(sizes[len(sizes) - k :]), k) for k in range(1, len(sizes))
+        ]
+        for g in groups:
+            ends = {e + 1 for _, e in g}
+            starts = {s for s, _ in g}
+            for top, extra in tops:
+                if top not in ends:
+                    continue
+                if layout.size == 0 or (
+                    layout.start in ends and layout.start + layout.size in starts
+                ):
+                    return "confirmed", (
+                        "the guest's own e820 memory map matches "
+                        f"(RAM up to {top:#x}"
+                        + (f", hole {layout.start:#x}-{layout.start + layout.size:#x}" if layout.size else "")
+                        + ")"
+                        + (
+                            f"; the last {extra} VAD(s) in the span ({full_top - top:#x} bytes) "
+                            "lie beyond the guest's RAM and are harmless trailing data"
+                            if extra
+                            else ""
+                        )
+                    )
+        top = full_top
+        # The same boot log is often present many times (copies in free memory,
+        # page cache, ...), so show each *distinct* memory map once.
+        distinct = list(dict.fromkeys(tuple(g) for g in groups))
+        shown = "; ".join(
+            "[" + ", ".join(f"{s:#x}-{e:#x}" for s, e in g) + "]" for g in distinct[:3]
+        )
+        return "contradicted", (
+            f"none of the {len(groups)} e820 record group(s) found matches the chosen "
+            f"layout (RAM top {top:#x}, hole {layout.start:#x}+{layout.size:#x}): {shown}. "
+            "They may be stale copies from earlier boots; if pslist/bash come back "
+            "empty while psscan works, override with --mmio-hole START:SIZE."
+        )
 
 
 
@@ -125,7 +306,13 @@ class linux_plugins(interfaces.plugins.PluginInterface):
 
     # Option names that belong to us (the Windows side); never forwarded to the
     # wrapped Linux plugin.
-    _OWN_REQUIREMENT_NAMES = {"kernel", "wsl_process", "dump_extra_regions", "linux_plugin"}
+    _OWN_REQUIREMENT_NAMES = {
+        "kernel",
+        "wsl_process",
+        "dump_extra_regions",
+        "linux_plugin",
+        "mmio_hole",
+    }
 
     @classmethod
     def get_requirements(cls) -> List[interfaces.configuration.RequirementInterface]:
@@ -152,6 +339,16 @@ class linux_plugins(interfaces.plugins.PluginInterface):
                 description=(
                     "Exact process name backing the WSL guest's memory, if it "
                     f"isn't one of the defaults searched automatically ({', '.join(sorted(WSL_PROCESS_NAMES))})"
+                ),
+                optional=True,
+            ),
+            requirements.StringRequirement(
+                name="mmio_hole",
+                description=(
+                    "Override the guest's MMIO-hole layout, as START:SIZE "
+                    "(e.g. 0xF8000000:0x8000000), or 'none' for no hole. Normally "
+                    "detected automatically from the Windows VAD layout and "
+                    "cross-checked against the guest's e820 map."
                 ),
                 optional=True,
             ),
@@ -231,7 +428,8 @@ class linux_plugins(interfaces.plugins.PluginInterface):
         span_end: int,
         dest_path: str,
         progress_label: str,
-        insert_mmio_hole: bool = False,
+        layout: Optional[_HoleLayout] = None,
+        scanner: Optional[_E820Scanner] = None,
     ) -> str:
         """Streams one [span_start, span_end] host-VA range out to dest_path,
         reusing an existing file of the right size instead of re-writing it.
@@ -239,16 +437,15 @@ class linux_plugins(interfaces.plugins.PluginInterface):
         Shared by the main guest-memory span (always dumped) and, optionally,
         every other span found in the process (see `dump_extra_regions`).
 
-        With insert_mmio_hole, 128 MiB of zeros are written at guest-physical
-        0xF8000000 (see _GUEST_MMIO_HOLE_START) so that the file is laid out by
-        guest-physical address. Only meaningful for the main RAM span.
+        With a `layout` that has a hole, `layout.size` bytes of zeros are
+        written at `layout.start` so that the file is laid out by guest-physical
+        address (see the MMIO-hole comment at the top of this module). Only
+        meaningful for the main RAM span. If a `scanner` is given, every chunk
+        written is fed to it (it is not fed when an existing dump is reused).
         """
         span_size = span_end - span_start + 1
-        hole = (
-            _GUEST_MMIO_HOLE_SIZE
-            if insert_mmio_hole and span_size > _GUEST_MMIO_HOLE_START
-            else 0
-        )
+        hole_start = layout.start if layout else 0
+        hole = layout.size if layout else 0
         out_size = span_size + hole
 
         # See the reuse comment in the caller for why we key on size too, not
@@ -265,18 +462,25 @@ class linux_plugins(interfaces.plugins.PluginInterface):
         written = 0  # bytes consumed from the host span (excludes the hole)
         with open(dest_path, "wb") as fh:
             while written < span_size:
-                if hole and written == _GUEST_MMIO_HOLE_START:
-                    # Reached the guest's MMIO gap: emit it as zeros, once.
-                    fh.write(bytes(hole))
+                if hole and written == hole_start:
+                    # Reached the guest's MMIO gap: emit it as zeros, once
+                    # (in slices, as the hole can be large with a custom layout).
+                    left = hole
+                    while left:
+                        n = min(left, _DUMP_CHUNK_SIZE)
+                        fh.write(bytes(n))
+                        left -= n
                     hole = 0
                 to_read = min(_DUMP_CHUNK_SIZE, span_size - written)
-                if hole and written < _GUEST_MMIO_HOLE_START:
+                if hole and written < hole_start:
                     # never let a chunk straddle the insertion point
-                    to_read = min(to_read, _GUEST_MMIO_HOLE_START - written)
+                    to_read = min(to_read, hole_start - written)
                 # pad=True: fill any unmapped/unavailable pages with zeros
                 # rather than aborting the dump, same as vadinfo/memmap do.
                 data = proc_layer.read(span_start + written, to_read, pad=True)
                 fh.write(data)
+                if scanner is not None:
+                    scanner.feed(data, written)
                 written += to_read
                 self._progress_callback(written * 100 // span_size, progress_label)
 
@@ -319,7 +523,20 @@ class linux_plugins(interfaces.plugins.PluginInterface):
         # large" (a big stack/heap region elsewhere in the process): we merge
         # every run of host-VA-adjacent VADs into one span and use the
         # largest resulting span, rather than the largest single VAD.
-        vads_by_start = sorted(vads, key=lambda v: v.get_start())
+        #
+        # Only VADs with committed pages are candidates. Every vmmem process
+        # also carries a ~4 GiB PAGE_NOACCESS *reservation* (0x10000-0xffffffff,
+        # zero commit charge) that holds no data; without this filter it would
+        # out-size the RAM of any guest under ~4 GiB and be dumped instead
+        # (seen with a 2 GiB guest). If nothing is committed, fall back to all.
+        def _commit(vad) -> int:
+            try:
+                return int(vad.get_commit_charge())
+            except AttributeError:
+                return 1  # can't tell: don't exclude it
+
+        candidates = [v for v in vads if _commit(v) > 0] or vads
+        vads_by_start = sorted(candidates, key=lambda v: v.get_start())
         spans = []  # list of [start, end, [vads...]]
         for vad in vads_by_start:
             start, end = vad.get_start(), vad.get_end()
@@ -337,7 +554,22 @@ class linux_plugins(interfaces.plugins.PluginInterface):
             f"{len(span_vads)} VAD(s)) as the WSL guest's physical memory"
         )
 
+        span_size = span_end - span_start + 1
+        # span_vads is already in address order (built from the sorted list).
+        vad_sizes = [v.get_end() - v.get_start() + 1 for v in span_vads]
+        layout = _choose_hole_layout(vad_sizes, span_size, self.config.get("mmio_hole"))
+        vollog.info(
+            f"PID {pid}: VAD sizes {[hex(s) for s in vad_sizes]}; MMIO hole "
+            + (
+                f"{layout.start:#x}+{layout.size:#x}"
+                if layout.size
+                else "none"
+            )
+            + f" ({layout.source})"
+        )
+
         dest_path = os.path.join(os.getcwd(), f"vmmemwsl.pid{pid}.dmp")
+        scanner = _E820Scanner()
         # This is the span the wrapped Linux plugin will actually be run
         # against, so a failure dumping it is fatal - let it raise.
         self._dump_span(
@@ -347,8 +579,23 @@ class linux_plugins(interfaces.plugins.PluginInterface):
             span_end,
             dest_path,
             f"Dumping WSL guest memory (PID {pid})",
-            insert_mmio_hole=True,
+            layout=layout,
+            scanner=scanner,
         )
+
+        # Cross-check the layout against the guest's own memory map. Never
+        # fatal: a long-running guest may have overwritten its boot log, and a
+        # reused dump isn't re-scanned.
+        if scanner.bytes_fed != span_size:
+            vollog.info("Reused an existing dump, so the e820 layout check was skipped")
+        else:
+            status, detail = scanner.verify(layout, span_size, vad_sizes)
+            if status == "confirmed":
+                vollog.info(f"MMIO layout check: {detail}")
+            elif status == "not_found":
+                vollog.info(f"MMIO layout check skipped: {detail}")
+            else:
+                vollog.warning(f"MMIO layout check: {detail}")
 
         if self.config.get("dump_extra_regions"):
             extra_spans = [s for s in spans if s is not main_span]
